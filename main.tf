@@ -9,6 +9,10 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.1.0"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.2.0" # Required for data.archive_file
+    }
   }
 }
 
@@ -42,7 +46,7 @@ resource "azurerm_cosmosdb_account" "db" {
   kind                = "GlobalDocumentDB"
 
   consistency_policy {
-    consistency_level       = "Session" # Simplified for free tier, avoids high staleness
+    consistency_level       = "Session" # Simplified for free tier
     max_interval_in_seconds = 5
     max_staleness_prefix    = 10
   }
@@ -77,7 +81,7 @@ resource "azurerm_storage_account" "storage_account" {
   }
 }
 
-# Storage Container (Single container to simplify, adjust as needed)
+# Storage Container
 resource "azurerm_storage_container" "storage_container" {
   name                  = "appazgoat${random_id.randomId.dec}-storage-container"
   storage_account_name  = azurerm_storage_account.storage_account.name
@@ -107,22 +111,22 @@ data "azurerm_storage_account_blob_container_sas" "storage_account_blob_containe
   }
 }
 
-# Populate Cosmos DB Data (Updated to use latest azure-cosmos)
+# Populate Cosmos DB Data
 resource "null_resource" "file_populate_data" {
   provisioner "local-exec" {
     command     = <<EOF
 sed -i 's/AZURE_FUNCTION_URL/${azurerm_storage_account.storage_account.name}.blob.core.windows.net/${azurerm_storage_container.storage_container.name}/g' modules/module-1/resources/cosmosdb/blog-posts.json
 python3 -m venv azure-goat-environment
 source azure-goat-environment/bin/activate
-pip3 install --upgrade azure-cosmos==4.6.0  # Updated to latest stable version as of 2025
+pip3 install --upgrade azure-cosmos==4.6.0  # Updated to latest stable version
 python3 modules/module-1/resources/cosmosdb/create-table.py
 EOF
-    interpreter = ["/bin/bash", "-c"]
+    interpreter = ["/bin/bash", -c"]
   }
   depends_on = [azurerm_cosmosdb_account.db, azurerm_storage_account.storage_account, azurerm_storage_container.storage_container]
 }
 
-# App Service Plan (Single plan for both function apps)
+# App Service Plan
 resource "azurerm_app_service_plan" "app_service_plan" {
   name                = "appazgoat${random_id.randomId.dec}-app-service-plan"
   resource_group_name = var.resource_group
@@ -135,7 +139,23 @@ resource "azurerm_app_service_plan" "app_service_plan" {
   }
 }
 
-# Function App (Backend)
+# Function App (Backend) - ZIP and Upload
+data "archive_file" "file_function_app" {
+  type        = "zip"
+  source_dir  = "modules/module-1/resources/azure_function/data"
+  output_path = "modules/module-1/resources/azure_function/data/data-api.zip"
+  depends_on  = [null_resource.file_populate_data] # Ensure env_replace is handled by populate_data
+}
+
+resource "azurerm_storage_blob" "storage_blob" {
+  name                   = "data-api.zip"
+  storage_account_name   = azurerm_storage_account.storage_account.name
+  storage_container_name = azurerm_storage_container.storage_container.name
+  type                   = "Block"
+  source                 = data.archive_file.file_function_app.output_path
+  depends_on             = [data.archive_file.file_function_app]
+}
+
 resource "azurerm_function_app" "function_app" {
   name                       = "appazgoat${random_id.randomId.dec}-function"
   resource_group_name        = var.resource_group
@@ -161,10 +181,26 @@ resource "azurerm_function_app" "function_app" {
   storage_account_name       = azurerm_storage_account.storage_account.name
   storage_account_access_key = azurerm_storage_account.storage_account.primary_access_key
   version                    = "~3"
-  depends_on                 = [azurerm_cosmosdb_account.db, azurerm_storage_account.storage_account, null_resource.file_populate_data]
+  depends_on                 = [azurerm_cosmosdb_account.db, azurerm_storage_account.storage_account, azurerm_storage_blob.storage_blob]
 }
 
-# Function App (Frontend)
+# Function App (Frontend) - ZIP and Upload
+data "archive_file" "file_function_app_front" {
+  type        = "zip"
+  source_dir  = "modules/module-1/resources/azure_function/react"
+  output_path = "modules/module-1/resources/azure_function/react/func.zip"
+  depends_on  = [null_resource.file_populate_data] # Ensure file_replacement_upload logic is handled
+}
+
+resource "azurerm_storage_blob" "storage_blob_front" {
+  name                   = "func.zip"
+  storage_account_name   = azurerm_storage_account.storage_account.name
+  storage_container_name = azurerm_storage_container.storage_container.name
+  type                   = "Block"
+  source                 = data.archive_file.file_function_app_front.output_path
+  depends_on             = [data.archive_file.file_function_app_front]
+}
+
 resource "azurerm_function_app" "function_app_front" {
   name                       = "appazgoat${random_id.randomId.dec}-function-app"
   resource_group_name        = var.resource_group
@@ -183,10 +219,10 @@ resource "azurerm_function_app" "function_app_front" {
   storage_account_name       = azurerm_storage_account.storage_account.name
   storage_account_access_key = azurerm_storage_account.storage_account.primary_access_key
   version                    = "~3"
-  depends_on                 = [azurerm_cosmosdb_account.db, azurerm_storage_account.storage_account]
+  depends_on                 = [azurerm_cosmosdb_account.db, azurerm_storage_account.storage_account, azurerm_storage_blob.storage_blob_front]
 }
 
-# VM and Networking (Simplified, keep minimal for free tier)
+# VM and Networking (Simplified)
 resource "azurerm_network_security_group" "net_sg" {
   name                = "SecGroupNet${random_id.randomId.dec}"
   location            = var.location
@@ -280,7 +316,7 @@ resource "azurerm_virtual_machine" "dev-vm" {
   depends_on = [azurerm_network_interface.net_int]
 }
 
-# Automation Account (Single instance for free tier)
+# Automation Account
 resource "azurerm_automation_account" "dev_automation_account_test" {
   name                = "dev-automation-account-appazgoat${random_id.randomId.dec}"
   location            = var.location
